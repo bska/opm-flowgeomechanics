@@ -1,3 +1,8 @@
+# Editor autosave files
+*~
+*.swp
+.dir-locals.el
+
 # Prerequisites
 *.d
 
@@ -16,6 +21,7 @@
 
 # Debugger Files
 *.pdb
+*.dSYM
 
 # Compiled Dynamic libraries
 *.so
