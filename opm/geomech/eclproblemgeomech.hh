@@ -21,29 +21,35 @@
 #define OPM_ECLPROBLEM_GEOMECH_HH
 
 #include <opm/common/ErrorMacros.hpp>
-
-#include <opm/elasticity/material.hh>
-#include <opm/elasticity/materials.hh>
+#include <opm/common/utility/Serializer.hpp>
 
 #include <opm/geomech/FlowGeomechLinearSolverParameters.hpp>
 #include <opm/geomech/boundaryutils.hh>
 #include <opm/geomech/eclgeomechmodel.hh>
 #include <opm/geomech/vtkgeomechmodule.hh>
 
-#include <opm/elasticity/material.hh>
+#include <opm/grid/common/CommunicationUtils.hpp>
+
 #include <opm/material/densead/Evaluation.hpp>
 #include <opm/material/densead/Math.hpp>
 
 #include <opm/simulators/flow/FlowProblem.hpp>
 #include <opm/simulators/flow/Transmissibility.hpp>
 #include <opm/simulators/linalg/PropertyTree.hpp>
+#include <opm/simulators/utils/MPIPacker.hpp>
+#include <opm/simulators/utils/ParallelCommunication.hpp>
 
+#include <opm/elasticity/material.hh>
+#include <opm/elasticity/materials.hh>
+
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cstddef>
 #include <functional>
 #include <initializer_list>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -51,6 +57,7 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 namespace Opm::Parameters
@@ -481,16 +488,34 @@ public:
             }
         }
 
-        bool commit_wellstate = false;
         auto sim_update = schedule.modifyCompletions(reportStep, extra_perfs);
 
-        // should not be used
-        auto updateTrans = [](const bool) {};
+        if (const auto comm = simulator.vanguard().grid().comm();
+            comm.sum(static_cast<int>(! sim_update.new_frac_wconns.empty())) > 0)
+        {
+            // Some, or all, of the 'extra_perfs' are entirely new
+            // connections created by the fracturing process.  Inform the
+            // summary vector calculation engine of these new connections so
+            // that they may be included in the summary output if needed.
+
+            const auto root = 0;
+            const auto newConns = CollectDynamicConns {
+                Mpi::Packer { comm }
+            }(comm, root, sim_update.new_frac_wconns);
+
+            if (comm.rank() == root) {
+                this->eclWriter_->recordNewDynamicWellConns(newConns);
+            }
+        }
 
         // alwas rebuild wells
         sim_update.well_structure_changed = true;
 
-        this->actionHandler_.applySimulatorUpdate(reportStep, sim_update, updateTrans, commit_wellstate);
+        bool commit_wellstate = false;
+        this->actionHandler_.applySimulatorUpdate(reportStep, sim_update,
+                                                  /* updateTrans = */ [](const bool) {},
+                                                  commit_wellstate);
+
         if (commit_wellstate) {
             this->wellModel().commitWGState();
         }
@@ -604,6 +629,67 @@ public:
     }
 
 private:
+    class CollectDynamicConns : private Serializer<Mpi::Packer>
+    {
+    public:
+        using DynamicConns =
+            std::vector<std::pair<std::string, std::vector<std::size_t>>>;
+
+        explicit CollectDynamicConns(const Mpi::Packer& pack)
+            : Serializer<Mpi::Packer> { pack }
+        {}
+
+        DynamicConns
+        operator()(const Parallel::Communication comm,
+                   const int                     root,
+                   const DynamicConns&           newConns)
+        {
+            if (comm.size() == 1) {
+                return newConns;
+            }
+
+            this->pack(newConns);
+
+            std::tie(this->rankBuffers_, this->rankStart_) =
+                gatherv(this->m_buffer, comm, root);
+
+            if (comm.rank() != root) {
+                // Non-root processes don't need any new connection objects.
+                return {};
+            }
+
+            auto allNewConns = DynamicConns{};
+            for (auto rank = 0*comm.size(); rank < comm.size(); ++rank) {
+                auto rankNewConns = this->deserialise(rank);
+
+                allNewConns.insert(allNewConns.end(),
+                                   std::make_move_iterator(rankNewConns.begin()),
+                                   std::make_move_iterator(rankNewConns.end()));
+            }
+
+            return allNewConns;
+        }
+
+    private:
+        std::vector<char> rankBuffers_{};
+        std::vector<int> rankStart_{};
+
+        DynamicConns deserialise(const std::size_t rank)
+        {
+            auto newConns = DynamicConns{};
+
+            auto begin = this->rankBuffers_.begin() + this->rankStart_[rank + 0];
+            auto end   = this->rankBuffers_.begin() + this->rankStart_[rank + 1];
+
+            this->m_buffer.assign(begin, end);
+            this->m_packSize = std::distance(begin, end);
+
+            this->unpack(newConns);
+
+            return newConns;
+        }
+    };
+
     GeomechModel geomechModel_;
 
     std::vector<double> ymodule_;
